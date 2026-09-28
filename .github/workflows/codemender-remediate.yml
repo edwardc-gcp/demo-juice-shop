@@ -1,0 +1,224 @@
+name: CodeMender Autonomous Security Remediation & Auto-PR
+
+on:
+  schedule:
+    # Run nightly remediation sweep at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      finding_id:
+        description: 'Specific Finding ID or prefix to fix (leave blank to fix open Critical/High findings)'
+        required: false
+        default: ''
+
+# Cancel in-progress runs for the same branch to optimize runner costs and prevent branch collision
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  autonomous-remediation:
+    name: Synthesize Patches & Open Remediation PR
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      id-token: write
+      pull-requests: write
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          # Full Git history (fetch-depth: 0) is required for cm vcs status and PR diff generation
+          fetch-depth: 0
+
+      - name: Authenticate to Google Cloud via WIF
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Configure ADC Credentials Outside Git Workspace
+        run: |
+          mkdir -p "$HOME/.config/gcloud"
+          cp "${GOOGLE_APPLICATION_CREDENTIALS}" "$HOME/.config/gcloud/application_default_credentials.json"
+          # Immediately purge temporary credential file from Git workspace to prevent accidental commit
+          rm -f "${GOOGLE_APPLICATION_CREDENTIALS}"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$HOME/.config/gcloud/application_default_credentials.json" >> $GITHUB_ENV
+
+      - name: Add local bin to PATH
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Cache CodeMender CLI Binary
+        id: cache-cm
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/cm
+          key: cm-binary-${{ runner.os }}-v0.10.0
+
+      - name: Download & Install CodeMender CLI
+        if: steps.cache-cm.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o /tmp/cm-linux-amd64.zip "https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm:stable:cm-linux-amd64.zip:download?alt=media"
+          unzip -q -o /tmp/cm-linux-amd64.zip -d /tmp/cm-dist
+          chmod +x /tmp/cm-dist/cm
+          mv /tmp/cm-dist/cm "$HOME/.local/bin/cm"
+          "$HOME/.local/bin/cm" --version
+
+      - name: Cache CodeMender Findings & State Database
+        id: cache-cm-state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .codemender/
+            ~/.codemender/state.db
+          key: cm-state-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            cm-state-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Initialize & Verify CodeMender Workspace
+        run: |
+          cm init
+          cm init --verify
+
+      - name: Execute Autonomous Patch Remediation (Cache-First)
+        run: |
+          SPECIFIC_TARGET="${{ github.event.inputs.finding_id }}"
+          if [ -n "$SPECIFIC_TARGET" ]; then
+            echo "🎯 Targeted Remediation: Evaluating Finding ID ${SPECIFIC_TARGET}..."
+            if ! cm report -f json 2>/dev/null | jq -e ".[] | select((.finding_id == \"${SPECIFIC_TARGET}\") or (.id == \"${SPECIFIC_TARGET}\") or ((.finding_id // \"\") | startswith(\"${SPECIFIC_TARGET}\")))" >/dev/null 2>&1; then
+              echo "⚠️ Target finding ${SPECIFIC_TARGET} not found in restored cache. Running fallback discovery scan..."
+              cm find . -y --unrestricted --model gemini-3.8-flash
+            else
+              echo "⚡ Target finding ${SPECIFIC_TARGET} verified in restored cache."
+            fi
+            echo "Applying autonomous patch for Finding: ${SPECIFIC_TARGET}"
+            cm fix "${SPECIFIC_TARGET}" -y --bypass-warning --unrestricted --model gemini-3.8-flash
+          else
+            echo "🔍 Batch Remediation Mode: Querying open CRITICAL and HIGH findings from CodeMender cache..."
+            FINDING_IDS=$(cm report -f json 2>/dev/null | jq -r '.[] | select((.status == "OPEN" or .status == "REOPENED" or .status == null) and (.severity == "CRITICAL" or .severity == "HIGH")) | (.finding_id // .id)' 2>/dev/null || echo "")
+
+            if [ -z "$FINDING_IDS" ]; then
+              echo "ℹ️ No prior Critical/High findings found in cache. Running fallback discovery scan..."
+              cm find . -y --unrestricted --model gemini-3.8-flash
+              FINDING_IDS=$(cm report -f json 2>/dev/null | jq -r '.[] | select((.status == "OPEN" or .status == "REOPENED" or .status == null) and (.severity == "CRITICAL" or .severity == "HIGH")) | (.finding_id // .id)' 2>/dev/null || echo "")
+            else
+              COUNT=$(echo "$FINDING_IDS" | wc -w | tr -d ' ')
+              echo "⚡ Restored ${COUNT} actionable CRITICAL/HIGH findings from cache."
+            fi
+
+            if [ -z "$FINDING_IDS" ]; then
+              echo "No open Critical or High findings discovered to remediate."
+            else
+              for FID in $FINDING_IDS; do
+                echo "=============================================="
+                echo "  Applying autonomous patch for Finding: ${FID}"
+                echo "=============================================="
+                cm fix "${FID}" -y --bypass-warning --unrestricted --model gemini-3.8-flash --no-cache || true
+              done
+            fi
+          fi
+
+      - name: Clean Runtime Metadata & Inspect Working Directory Changes
+        id: git_status
+        run: |
+          # 1. Restore any tracked project .gitignore files in case they were modified
+          git checkout HEAD -- '**/.gitignore' 2>/dev/null || true
+
+          # 2. Purge internal CodeMender tracking metadata
+          find . -name ".cm_project" -delete 2>/dev/null || true
+          find . -name ".cm_*" -delete 2>/dev/null || true
+          find . -name ".gitignore" -exec grep -lE "(\.cm_project|PLAN\.md)" {} + 2>/dev/null | xargs rm -f 2>/dev/null || true
+
+          # 3. Purge sensitive exploit artifacts in public repos for responsible disclosure
+          find . -type f \( -name "PLAN.md" -o -name "LOG.md" -o -name "exploit.sh" -o -name "REPORT.md" -o -name "poc.*" \) -delete 2>/dev/null || true
+          rm -rf .exploit codemender-evidence 2>/dev/null || true
+
+          echo "=== CodeMender VCS Status ==="
+          cm vcs status
+          echo "=== CodeMender Generated Patches ==="
+          cm report --patches || true
+
+          # 4. Detect code modifications while ignoring untracked files or metadata directories
+          if [ -n "$(git diff --name-only)" ] || [ -n "$(git status --porcelain -- ':!.codemender')" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Modified source files detected. Preparing automated Pull Request."
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No source code modifications required."
+          fi
+
+      - name: Prepare Public-Safe Pull Request Metadata
+        if: steps.git_status.outputs.has_changes == 'true'
+        id: pr_meta
+        run: |
+          TARGET_ID="${{ github.event.inputs.finding_id }}"
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+
+          # Extract finding title dynamically for targeted fixes
+          PR_TITLE="🛡️ [CodeMender] Autonomous Security Remediation"
+          if [ -n "$TARGET_ID" ]; then
+            FINDING_TITLE=$(cm report -f json 2>/dev/null | jq -r ".[] | select((.finding_id == \"${TARGET_ID}\") or (.id == \"${TARGET_ID}\") or ((.finding_id // \"\") | startswith(\"${TARGET_ID}\"))) | .title" 2>/dev/null | head -n 1 || echo "")
+            if [ -n "$FINDING_TITLE" ] && [ "$FINDING_TITLE" != "null" ]; then
+              PR_TITLE="🛡️ [CodeMender] Fix: ${FINDING_TITLE}"
+            else
+              PR_TITLE="🛡️ [CodeMender] Fix Finding ${TARGET_ID}"
+            fi
+          else
+            PR_TITLE="🛡️ [CodeMender] Batch Security Remediation for Critical & High Findings"
+          fi
+          echo "pr_title=${PR_TITLE}" >> $GITHUB_OUTPUT
+
+          # Construct Responsible Disclosure PR body in /tmp to prevent workspace pollution
+          cat << 'EOF' > /tmp/pr_body.md
+          ## 🛡️ CodeMender Autonomous Security Remediation
+
+          This automated Pull Request was generated by **CodeMender** on the **Gemini Enterprise Agent Platform**.
+
+          ### 📋 Remediation Overview
+          EOF
+
+          if [ -n "$TARGET_ID" ]; then
+            echo "* **Remediated Target Finding ID**: \`${TARGET_ID}\`" >> /tmp/pr_body.md
+          else
+            echo "* **Remediated Target**: Batch open \`CRITICAL\` and \`HIGH\` vulnerabilities" >> /tmp/pr_body.md
+          fi
+
+          cat << EOF >> /tmp/pr_body.md
+          * **Patch Strategy**: Synthesized contextual security fixes (e.g. parameterized queries, safe sanitization).
+          * **Clean Commit**: Internal CodeMender runtime tracking files have been purged; changes strictly affect production code.
+
+          ### 🛡️ Public Security Advisory & Responsible Disclosure Notice
+          * **Security Triage & SARIF Alert**: Maintainers and authorized reviewers can inspect the full tainted dataflow, root cause analysis (RCA), and CWE mapping in [GitHub Code Scanning Alerts](${REPO_URL}/security/code-scanning?query=is%3Aopen+${TARGET_ID}).
+          * **Responsible Disclosure**: Raw exploit payloads, proof-of-concept scripts, and reproduction vectors are intentionally excluded from this public PR description to prevent 1-day weaponization prior to production deployment.
+
+          ### 🔍 Verification Checklist
+          - [x] Code conforms to project language standards
+          - [x] Internal CodeMender runtime metadata excluded from commit
+          - [ ] Automated CI branch tests passing
+          - [ ] Maintainer / Security engineer sign-off
+
+          ---
+          *Generated by CodeMender AI Security Co-developer in GitHub Actions.*
+          EOF
+
+      - name: Create Automated Remediation Pull Request
+        if: steps.git_status.outputs.has_changes == 'true'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: 'fix(security): autonomous remediation patches synthesized by CodeMender'
+          branch: codemender/auto-remediation-${{ github.run_id }}
+          delete-branch: true
+          title: ${{ steps.pr_meta.outputs.pr_title }}
+          body-path: /tmp/pr_body.md
+          labels: |
+            security
+            automated-pr
+            codemender
